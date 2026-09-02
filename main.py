@@ -553,6 +553,18 @@ def ensure_generated_video(video: VideoRecord) -> None:
     try:
         run(ffmpeg_cmd, check=True, capture_output=True)
         video.generated_video_path = f"/static/videos/{output_file.name}"
+    except FileNotFoundError as exc:
+        video.status = JobStatus.FAILED
+        video.error_code = "FFMPEG_NOT_AVAILABLE"
+        add_log(
+            event="video_generation_failed",
+            user_id=video.user_id,
+            project_id=video.project_id,
+            video_id=video.video_id,
+            status=video.status,
+            error_code=video.error_code,
+        )
+        raise HTTPException(status_code=500, detail="動画生成エンジンが利用できません") from exc
     except CalledProcessError as exc:
         video.status = JobStatus.FAILED
         video.error_code = "VIDEO_GENERATION_FAILED"
