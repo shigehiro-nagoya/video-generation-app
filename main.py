@@ -1,3 +1,4 @@
+import asyncio
 import os
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -28,7 +29,9 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 STATIC_DIR = BASE_DIR / "static"
 VIDEO_OUTPUT_DIR = STATIC_DIR / "videos"
+AUDIO_OUTPUT_DIR = STATIC_DIR / "audio"
 VIDEO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+AUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -181,6 +184,8 @@ class CreateVideoRequest(BaseModel):
     length: str
     quality: str
     assets: List[AssetInput]
+    narration_enabled: bool = False
+    narration_text: Optional[str] = None
 
 
 class VideoCreateResponse(BaseModel):
@@ -202,6 +207,9 @@ class VideoRecord(BaseModel):
     length: str
     quality: str
     assets: List[AssetInput]
+    narration_enabled: bool = False
+    narration_text: Optional[str] = None
+    narration_audio_path: Optional[str] = None
     status: JobStatus
     created_at: datetime
     updated_at: datetime
@@ -228,6 +236,9 @@ class ResultResponse(BaseModel):
     created_at: datetime
     assets_count: int
     generated_video_url: Optional[str] = None
+    narration_enabled: bool = False
+    narration_text: Optional[str] = None
+    narration_audio_url: Optional[str] = None
     output_policy: OutputPolicy
     transform_plan: TransformPlan
 
@@ -289,6 +300,8 @@ ALLOWED_QUALITIES = {
 
 LENGTH_PRIORITY = ["短め", "ふつう", "長め", "しっかり長め"]
 QUALITY_PRIORITY = ["標準", "高め", "高画質 / HD"]
+BASE_DURATION_SECONDS = {"短め": 4, "ふつう": 6, "長め": 8, "しっかり長め": 10}
+DEFAULT_NARRATION_VOICE = "ja-JP-NanamiNeural"
 
 
 def now_utc() -> datetime:
@@ -371,6 +384,74 @@ def build_plan_restriction_detail(
         "upgrade_message": upgrade_message,
     }
 
+
+
+def normalize_narration_text(raw_text: Optional[str]) -> Optional[str]:
+    if raw_text is None:
+        return None
+    text = " ".join(raw_text.strip().split())
+    if not text:
+        return None
+    return text[:300]
+
+
+def estimate_narration_duration_seconds(text: Optional[str]) -> int:
+    if not text:
+        return 0
+    return max(4, min(18, len(text) // 6 + 2))
+
+
+def build_video_duration_seconds(video: VideoRecord) -> int:
+    base_duration = BASE_DURATION_SECONDS.get(video.length, 4)
+    narration_duration = estimate_narration_duration_seconds(video.narration_text if video.narration_enabled else None)
+    return max(base_duration, narration_duration)
+
+
+def synthesize_narration_audio(video: VideoRecord) -> None:
+    if not video.narration_enabled or not video.narration_text:
+        return
+    output_file = AUDIO_OUTPUT_DIR / f"{video.video_id}.mp3"
+    if output_file.exists():
+        video.narration_audio_path = f"/static/audio/{output_file.name}"
+        return
+    try:
+        import edge_tts
+    except Exception:
+        video.narration_audio_path = None
+        add_log(
+            event="narration_unavailable",
+            user_id=video.user_id,
+            project_id=video.project_id,
+            video_id=video.video_id,
+            status=video.status,
+            error_code="EDGE_TTS_NOT_AVAILABLE",
+        )
+        return
+
+    async def _save() -> None:
+        communicate = edge_tts.Communicate(video.narration_text, voice=DEFAULT_NARRATION_VOICE)
+        await communicate.save(str(output_file))
+
+    try:
+        asyncio.run(_save())
+        video.narration_audio_path = f"/static/audio/{output_file.name}"
+        add_log(
+            event="narration_generated",
+            user_id=video.user_id,
+            project_id=video.project_id,
+            video_id=video.video_id,
+            status=video.status,
+        )
+    except Exception:
+        video.narration_audio_path = None
+        add_log(
+            event="narration_generation_failed",
+            user_id=video.user_id,
+            project_id=video.project_id,
+            video_id=video.video_id,
+            status=video.status,
+            error_code="NARRATION_GENERATION_FAILED",
+        )
 
 
 def validate_plan_rules(payload: CreateVideoRequest) -> None:
@@ -516,6 +597,9 @@ def ensure_generated_video(video: VideoRecord) -> None:
     scale_divisor = max(1, max(target_width, target_height) // 960)
     actual_width = max(2, ((target_width // scale_divisor) // 2) * 2)
     actual_height = max(2, ((target_height // scale_divisor) // 2) * 2)
+    duration_seconds = build_video_duration_seconds(video)
+    synthesize_narration_audio(video)
+
     ffmpeg_cmd = [
         "ffmpeg",
         "-y",
@@ -523,13 +607,20 @@ def ensure_generated_video(video: VideoRecord) -> None:
         "lavfi",
         "-i",
         f"testsrc2=size={actual_width}x{actual_height}:rate=12",
-        "-f",
-        "lavfi",
-        "-i",
-        "anullsrc=channel_layout=stereo:sample_rate=24000",
+    ]
+    if video.narration_audio_path:
+        ffmpeg_cmd += ["-i", str(AUDIO_OUTPUT_DIR / f"{video.video_id}.mp3")]
+    else:
+        ffmpeg_cmd += [
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=24000",
+        ]
+    ffmpeg_cmd += [
         "-shortest",
         "-t",
-        "3",
+        str(duration_seconds),
         "-c:v",
         "libx264",
         "-preset",
@@ -627,7 +718,7 @@ def to_result(video: VideoRecord, request: Request) -> ResultResponse:
         video_id=video.video_id,
         project_id=video.project_id,
         status=video.status,
-        title=f"{video.platform}向け動画",
+        title=(f"{video.platform}向けナレーション付き動画" if video.narration_enabled and video.narration_text else f"{video.platform}向け動画"),
         platform=preset,
         save_enabled=playable,
         share_enabled=playable,
@@ -635,6 +726,9 @@ def to_result(video: VideoRecord, request: Request) -> ResultResponse:
         created_at=video.created_at,
         assets_count=len(video.assets),
         generated_video_url=generated_video_url,
+        narration_enabled=video.narration_enabled,
+        narration_text=video.narration_text,
+        narration_audio_url=build_absolute_url(request, video.narration_audio_path) if video.narration_audio_path else None,
         output_policy=get_output_policy(video.platform),
         transform_plan=build_transform_plan(video),
     )
@@ -679,6 +773,8 @@ def create_video(payload: CreateVideoRequest) -> VideoCreateResponse:
         length=payload.length,
         quality=payload.quality,
         assets=payload.assets,
+        narration_enabled=payload.narration_enabled,
+        narration_text=normalize_narration_text(payload.narration_text) if payload.narration_enabled else None,
         status=JobStatus.PREPARING,
         created_at=created,
         updated_at=created,
@@ -690,6 +786,8 @@ def create_video(payload: CreateVideoRequest) -> VideoCreateResponse:
         "orientation": payload.orientation,
         "length": payload.length,
         "quality": payload.quality,
+        "narration_enabled": "true" if payload.narration_enabled else "false",
+        "narration_text": normalize_narration_text(payload.narration_text) or "",
     }
 
     USER_PREFERENCES[payload.user_id] = {
