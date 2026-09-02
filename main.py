@@ -512,41 +512,42 @@ def ensure_generated_video(video: VideoRecord) -> None:
         video.generated_video_path = f"/static/videos/{output_file.name}"
         return
 
-    source_width, source_height = infer_source_size(video)
-    policy = get_output_policy(video.platform)
-    transform = build_transform_plan(video)
+    target_width, target_height = parse_output_size(video.platform)
+    scale_divisor = max(1, max(target_width, target_height) // 960)
+    actual_width = max(2, ((target_width // scale_divisor) // 2) * 2)
+    actual_height = max(2, ((target_height // scale_divisor) // 2) * 2)
     ffmpeg_cmd = [
         "ffmpeg",
         "-y",
         "-f",
         "lavfi",
         "-i",
-        f"testsrc2=size={source_width}x{source_height}:rate=30",
+        f"testsrc2=size={actual_width}x{actual_height}:rate=12",
         "-f",
         "lavfi",
         "-i",
-        "anullsrc=channel_layout=stereo:sample_rate=48000",
-        "-vf",
-        transform.ffmpeg_filter,
+        "anullsrc=channel_layout=stereo:sample_rate=24000",
         "-shortest",
         "-t",
-        "4",
+        "3",
         "-c:v",
         "libx264",
-        "-b:v",
-        policy.target_video_bitrate,
-        "-maxrate",
-        policy.target_video_bitrate,
-        "-bufsize",
-        policy.target_video_bitrate,
+        "-preset",
+        "ultrafast",
+        "-tune",
+        "zerolatency",
+        "-crf",
+        "32",
         "-pix_fmt",
         "yuv420p",
         "-movflags",
         "+faststart",
+        "-threads",
+        "1",
         "-c:a",
         "aac",
         "-b:a",
-        "128k",
+        "64k",
         str(output_file),
     ]
 
