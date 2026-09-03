@@ -1,11 +1,15 @@
 import asyncio
 import base64
+import mimetypes
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from subprocess import CalledProcessError, run
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
+from urllib.request import urlopen
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -31,8 +35,10 @@ PORT = int(os.getenv("PORT", "8000"))
 STATIC_DIR = BASE_DIR / "static"
 VIDEO_OUTPUT_DIR = STATIC_DIR / "videos"
 AUDIO_OUTPUT_DIR = STATIC_DIR / "audio"
+ASSET_OUTPUT_DIR = STATIC_DIR / "assets"
 VIDEO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 AUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+ASSET_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -46,6 +52,11 @@ class GenerationType(str, Enum):
     PHOTO_TO_VIDEO = "PHOTO_TO_VIDEO"
     PHOTO_SLIDESHOW = "PHOTO_SLIDESHOW"
     VIDEO_TO_VIDEO = "VIDEO_TO_VIDEO"
+
+
+class RenderMode(str, Enum):
+    STANDARD = "standard"
+    AI_PREMIUM = "ai_premium"
 
 
 class JobStatus(str, Enum):
@@ -173,6 +184,8 @@ OUTPUT_POLICIES: Dict[str, OutputPolicy] = {
 class AssetInput(BaseModel):
     uri: str
     kind: str = Field(pattern="^(image|video)$")
+    data_base64: Optional[str] = None
+    mime_type: Optional[str] = None
 
 
 class CreateVideoRequest(BaseModel):
@@ -184,6 +197,7 @@ class CreateVideoRequest(BaseModel):
     orientation: str
     length: str
     quality: str
+    render_mode: RenderMode = RenderMode.STANDARD
     assets: List[AssetInput]
     narration_enabled: bool = False
     narration_text: Optional[str] = None
@@ -208,6 +222,7 @@ class VideoRecord(BaseModel):
     orientation: str
     length: str
     quality: str
+    render_mode: RenderMode = RenderMode.STANDARD
     assets: List[AssetInput]
     narration_enabled: bool = False
     narration_text: Optional[str] = None
@@ -218,6 +233,7 @@ class VideoRecord(BaseModel):
     updated_at: datetime
     error_code: Optional[str] = None
     generated_video_path: Optional[str] = None
+    engine_label: Optional[str] = None
 
 
 class StatusResponse(BaseModel):
@@ -239,6 +255,9 @@ class ResultResponse(BaseModel):
     created_at: datetime
     assets_count: int
     generated_video_url: Optional[str] = None
+    render_mode: RenderMode = RenderMode.STANDARD
+    render_mode_label: str
+    engine_label: Optional[str] = None
     narration_enabled: bool = False
     narration_text: Optional[str] = None
     narration_voice: Optional[str] = None
@@ -325,6 +344,8 @@ NARRATION_VOICE_OPTIONS = {
     },
 }
 EDGE_TTS_FALLBACK_VOICE = "ja-JP-NanamiNeural"
+VEO_VIDEO_MODEL = os.getenv("VEO_VIDEO_MODEL", "veo-3.1-fast-generate-preview")
+VEO_VIDEO_RESOLUTION = os.getenv("VEO_VIDEO_RESOLUTION", "720p")
 
 
 def now_utc() -> datetime:
@@ -428,6 +449,17 @@ def normalize_narration_voice(raw_voice: Optional[str]) -> str:
 def narration_voice_label(voice: Optional[str]) -> str:
     preset = NARRATION_VOICE_OPTIONS.get(normalize_narration_voice(voice), NARRATION_VOICE_OPTIONS[DEFAULT_NARRATION_PRESET])
     return str(preset["label"])
+
+
+def normalize_render_mode(raw_mode: Optional[str]) -> RenderMode:
+    candidate = (raw_mode or "").strip().lower()
+    if candidate == RenderMode.AI_PREMIUM.value:
+        return RenderMode.AI_PREMIUM
+    return RenderMode.STANDARD
+
+
+def render_mode_label(mode: RenderMode) -> str:
+    return "きれい・高品質" if mode == RenderMode.AI_PREMIUM else "はやい・安い"
 
 
 def build_gemini_tts_prompt(video: VideoRecord) -> str:
@@ -542,6 +574,178 @@ def synthesize_narration_audio(video: VideoRecord) -> None:
             status=video.status,
             error_code="NARRATION_GENERATION_FAILED",
         )
+
+
+def decode_base64_payload(raw_value: str) -> tuple[bytes, Optional[str]]:
+    payload = raw_value.strip()
+    mime_type = None
+    if payload.startswith("data:") and "," in payload:
+        header, payload = payload.split(",", 1)
+        mime_type = header[5:].split(";", 1)[0]
+    return base64.b64decode(payload), mime_type
+
+
+def guess_asset_extension(mime_type: Optional[str]) -> str:
+    if not mime_type:
+        return ".jpg"
+    guessed = mimetypes.guess_extension(mime_type.split(";", 1)[0].strip())
+    if guessed == ".jpe":
+        return ".jpg"
+    return guessed or ".jpg"
+
+
+def materialize_primary_image(video: VideoRecord) -> Path:
+    image_asset = next((asset for asset in video.assets if asset.kind == "image"), None)
+    if image_asset is None:
+        raise HTTPException(status_code=400, detail="画像素材が必要です")
+
+    if image_asset.data_base64:
+        raw_bytes, hinted_mime = decode_base64_payload(image_asset.data_base64)
+        mime_type = image_asset.mime_type or hinted_mime or "image/jpeg"
+        file_path = ASSET_OUTPUT_DIR / f"{video.video_id}{guess_asset_extension(mime_type)}"
+        file_path.write_bytes(raw_bytes)
+        return file_path
+
+    raw_uri = image_asset.uri.strip()
+    if raw_uri.startswith("file://"):
+        file_path = Path(urlparse(raw_uri).path)
+        if file_path.exists():
+            return file_path
+    elif raw_uri.startswith("http://") or raw_uri.startswith("https://"):
+        mime_type = image_asset.mime_type or "image/jpeg"
+        file_path = ASSET_OUTPUT_DIR / f"{video.video_id}{guess_asset_extension(mime_type)}"
+        with urlopen(raw_uri, timeout=30) as response:
+            file_path.write_bytes(response.read())
+        return file_path
+
+    raise HTTPException(status_code=400, detail="画像データをサーバーへ送れませんでした")
+
+
+def build_visual_prompt(video: VideoRecord) -> str:
+    style_map = {
+        "かんたん": "自然で見やすいスマホ向け紹介動画",
+        "AIで動かす": "被写体を自然に動かす短いシネマティック動画",
+        "きれいに見せる": "やや上品で滑らかな広告風ショート動画",
+    }
+    platform_text = PLATFORM_PRESETS.get(video.platform, PlatformPreset(name=video.platform, aspect_ratio="9:16", output_size="1080x1920")).aspect_ratio
+    return (
+        f"Create a short social video from a single photo for {video.platform}. "
+        f"Keep the subject identity intact, avoid extra people or text overlays, and preserve the original composition as much as possible. "
+        f"Style: {style_map.get(video.style, 'natural social video')}. "
+        f"Aspect ratio target: {platform_text}. "
+        "Camera movement should be subtle and natural. No subtitles, no captions, no logo, no voiceover, no background music, and no sound effects."
+    )
+
+
+def build_standard_motion_filter(target_width: int, target_height: int, duration_seconds: int) -> str:
+    total_frames = max(duration_seconds * 12, 48)
+    return (
+        f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase,"
+        f"crop={target_width}:{target_height},"
+        f"zoompan=z='min(zoom+0.0015,1.12)':"
+        f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+        f"d={total_frames}:s={target_width}x{target_height}:fps=12,"
+        "format=yuv420p"
+    )
+
+
+def audio_input_args(video: VideoRecord) -> list[str]:
+    if video.narration_audio_path:
+        return ["-i", str(BASE_DIR / video.narration_audio_path.lstrip("/"))]
+    return ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=24000"]
+
+
+def render_standard_image_video(video: VideoRecord, image_path: Path, output_file: Path) -> None:
+    target_width, target_height = parse_output_size(video.platform)
+    scale_divisor = max(1, max(target_width, target_height) // 960)
+    actual_width = max(2, ((target_width // scale_divisor) // 2) * 2)
+    actual_height = max(2, ((target_height // scale_divisor) // 2) * 2)
+    duration_seconds = build_video_duration_seconds(video)
+    filter_chain = build_standard_motion_filter(actual_width, actual_height, duration_seconds)
+    ffmpeg_cmd = [
+        "ffmpeg", "-y", "-loop", "1", "-i", str(image_path),
+        *audio_input_args(video),
+        "-filter:v", filter_chain,
+        "-shortest", "-t", str(duration_seconds),
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "24",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-c:a", "aac",
+        "-b:a", "96k",
+        str(output_file),
+    ]
+    run(ffmpeg_cmd, check=True, capture_output=True)
+    video.generated_video_path = f"/static/videos/{output_file.name}"
+    video.engine_label = "FFmpeg ズーム/パン + Gemini TTS" if video.narration_audio_path else "FFmpeg ズーム/パン"
+
+
+def mux_video_with_audio(source_video: Path, video: VideoRecord, output_file: Path) -> None:
+    ffmpeg_cmd = ["ffmpeg", "-y", "-i", str(source_video)]
+    if video.narration_audio_path:
+        ffmpeg_cmd += ["-i", str(BASE_DIR / video.narration_audio_path.lstrip("/")), "-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+    else:
+        ffmpeg_cmd += ["-an"]
+    ffmpeg_cmd += ["-c:v", "copy", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(output_file)]
+    run(ffmpeg_cmd, check=True, capture_output=True)
+    video.generated_video_path = f"/static/videos/{output_file.name}"
+
+
+def render_ai_premium_video(video: VideoRecord, image_path: Path, output_file: Path) -> None:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY_MISSING")
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+    image = types.Image.from_file(location=str(image_path), mime_type="image/jpeg")
+    aspect_ratio = PLATFORM_PRESETS.get(video.platform, PlatformPreset(name=video.platform, aspect_ratio="9:16", output_size="1080x1920")).aspect_ratio.split(" /")[0]
+    if aspect_ratio not in {"9:16", "16:9"}:
+        aspect_ratio = "9:16"
+    operation = client.models.generate_videos(
+        model=VEO_VIDEO_MODEL,
+        prompt=build_visual_prompt(video),
+        image=image,
+        config={
+            "aspect_ratio": aspect_ratio,
+            "duration_seconds": 8,
+            "resolution": VEO_VIDEO_RESOLUTION,
+            "generate_audio": False,
+        },
+    )
+    attempts = 0
+    while not operation.done and attempts < 30:
+        time.sleep(10)
+        operation = client.operations.get(operation)
+        attempts += 1
+    if not operation.done:
+        raise RuntimeError("VEO_TIMEOUT")
+    generated = operation.response.generated_videos[0]
+    temp_video = VIDEO_OUTPUT_DIR / f"{video.video_id}.veo.mp4"
+    client.files.download(file=generated.video, destination=str(temp_video))
+    mux_video_with_audio(temp_video, video, output_file)
+    video.engine_label = f"{VEO_VIDEO_MODEL} + Gemini TTS" if video.narration_audio_path else VEO_VIDEO_MODEL
+
+
+def render_test_pattern_video(video: VideoRecord, output_file: Path) -> None:
+    target_width, target_height = parse_output_size(video.platform)
+    scale_divisor = max(1, max(target_width, target_height) // 960)
+    actual_width = max(2, ((target_width // scale_divisor) // 2) * 2)
+    actual_height = max(2, ((target_height // scale_divisor) // 2) * 2)
+    duration_seconds = build_video_duration_seconds(video)
+    ffmpeg_cmd = [
+        "ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc2=size={actual_width}x{actual_height}:rate=12",
+        *audio_input_args(video),
+        "-shortest", "-t", str(duration_seconds),
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "32",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-threads", "1",
+        "-c:a", "aac", "-b:a", "64k", str(output_file),
+    ]
+    run(ffmpeg_cmd, check=True, capture_output=True)
+    video.generated_video_path = f"/static/videos/{output_file.name}"
+    video.engine_label = "テストパターン出力"
 
 
 def validate_plan_rules(payload: CreateVideoRequest) -> None:
@@ -683,58 +887,33 @@ def ensure_generated_video(video: VideoRecord) -> None:
         video.generated_video_path = f"/static/videos/{output_file.name}"
         return
 
-    target_width, target_height = parse_output_size(video.platform)
-    scale_divisor = max(1, max(target_width, target_height) // 960)
-    actual_width = max(2, ((target_width // scale_divisor) // 2) * 2)
-    actual_height = max(2, ((target_height // scale_divisor) // 2) * 2)
-    duration_seconds = build_video_duration_seconds(video)
     synthesize_narration_audio(video)
 
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "lavfi",
-        "-i",
-        f"testsrc2=size={actual_width}x{actual_height}:rate=12",
-    ]
-    if video.narration_audio_path:
-        ffmpeg_cmd += ["-i", str(BASE_DIR / video.narration_audio_path.lstrip("/"))]
-    else:
-        ffmpeg_cmd += [
-            "-f",
-            "lavfi",
-            "-i",
-            "anullsrc=channel_layout=stereo:sample_rate=24000",
-        ]
-    ffmpeg_cmd += [
-        "-shortest",
-        "-t",
-        str(duration_seconds),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-tune",
-        "zerolatency",
-        "-crf",
-        "32",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        "-threads",
-        "1",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "64k",
-        str(output_file),
-    ]
-
     try:
-        run(ffmpeg_cmd, check=True, capture_output=True)
-        video.generated_video_path = f"/static/videos/{output_file.name}"
+        image_path = materialize_primary_image(video)
+        if video.render_mode == RenderMode.AI_PREMIUM:
+            try:
+                render_ai_premium_video(video, image_path, output_file)
+                add_log(
+                    event="premium_video_generated",
+                    user_id=video.user_id,
+                    project_id=video.project_id,
+                    video_id=video.video_id,
+                    status=video.status,
+                )
+            except Exception:
+                add_log(
+                    event="premium_video_fallback",
+                    user_id=video.user_id,
+                    project_id=video.project_id,
+                    video_id=video.video_id,
+                    status=video.status,
+                    error_code="PREMIUM_FALLBACK_STANDARD",
+                )
+                render_standard_image_video(video, image_path, output_file)
+                video.engine_label = f"FFmpeg ズーム/パン（{VEO_VIDEO_MODEL}失敗時フォールバック）"
+        else:
+            render_standard_image_video(video, image_path, output_file)
     except FileNotFoundError as exc:
         video.status = JobStatus.FAILED
         video.error_code = "FFMPEG_NOT_AVAILABLE"
@@ -757,6 +936,20 @@ def ensure_generated_video(video: VideoRecord) -> None:
             video_id=video.video_id,
             status=video.status,
             error_code=video.error_code,
+        )
+        raise HTTPException(status_code=500, detail="動画ファイルの作成に失敗しました") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        video.status = JobStatus.FAILED
+        video.error_code = "VIDEO_GENERATION_FAILED"
+        add_log(
+            event="video_generation_failed",
+            user_id=video.user_id,
+            project_id=video.project_id,
+            video_id=video.video_id,
+            status=video.status,
+            error_code=f"{video.error_code or 'VIDEO_GENERATION_FAILED'}:{type(exc).__name__}",
         )
         raise HTTPException(status_code=500, detail="動画ファイルの作成に失敗しました") from exc
 
@@ -816,6 +1009,9 @@ def to_result(video: VideoRecord, request: Request) -> ResultResponse:
         created_at=video.created_at,
         assets_count=len(video.assets),
         generated_video_url=generated_video_url,
+        render_mode=video.render_mode,
+        render_mode_label=render_mode_label(video.render_mode),
+        engine_label=video.engine_label,
         narration_enabled=video.narration_enabled,
         narration_text=video.narration_text,
         narration_voice=narration_voice_label(video.narration_voice) if video.narration_enabled else None,
@@ -863,6 +1059,7 @@ def create_video(payload: CreateVideoRequest) -> VideoCreateResponse:
         orientation=payload.orientation,
         length=payload.length,
         quality=payload.quality,
+        render_mode=normalize_render_mode(payload.render_mode),
         assets=payload.assets,
         narration_enabled=payload.narration_enabled,
         narration_text=normalize_narration_text(payload.narration_text) if payload.narration_enabled else None,
@@ -878,6 +1075,7 @@ def create_video(payload: CreateVideoRequest) -> VideoCreateResponse:
         "orientation": payload.orientation,
         "length": payload.length,
         "quality": payload.quality,
+        "render_mode": render_mode_label(normalize_render_mode(payload.render_mode)),
         "narration_enabled": "true" if payload.narration_enabled else "false",
         "narration_text": normalize_narration_text(payload.narration_text) or "",
         "narration_voice": narration_voice_label(payload.narration_voice) if payload.narration_enabled else "",
