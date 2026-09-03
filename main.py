@@ -3,6 +3,7 @@ import base64
 import mimetypes
 import os
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -354,6 +355,12 @@ def now_utc() -> datetime:
 
 
 
+def debug_log(message: str, **fields: object) -> None:
+    payload = " ".join(f"{key}={fields[key]!r}" for key in fields)
+    print(f"[premium-debug] {message}" + (f" | {payload}" if payload else ""), flush=True)
+
+
+
 def add_log(
     event: str,
     user_id: str,
@@ -696,6 +703,7 @@ def mux_video_with_audio(source_video: Path, video: VideoRecord, output_file: Pa
 def render_ai_premium_video(video: VideoRecord, image_path: Path, output_file: Path) -> None:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
+        debug_log("missing_gemini_api_key", video_id=video.video_id)
         raise RuntimeError("GEMINI_API_KEY_MISSING")
     from google import genai
     from google.genai import types
@@ -714,30 +722,48 @@ def render_ai_premium_video(video: VideoRecord, image_path: Path, output_file: P
         duration_seconds = 8
     else:
         duration_seconds = requested_duration if requested_duration in {4, 6, 8} else 6
+    config = {
+        "aspect_ratio": aspect_ratio,
+        "duration_seconds": duration_seconds,
+        "resolution": resolution,
+        "person_generation": "allow_adult",
+    }
+    debug_log(
+        "veo_request_start",
+        video_id=video.video_id,
+        model=VEO_VIDEO_MODEL,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+        duration_seconds=duration_seconds,
+        platform=video.platform,
+    )
     operation = client.models.generate_videos(
         model=VEO_VIDEO_MODEL,
         prompt=build_visual_prompt(video),
         image=image,
-        config={
-            "aspect_ratio": aspect_ratio,
-            "duration_seconds": duration_seconds,
-            "resolution": resolution,
-            "person_generation": "allow_adult",
-        },
+        config=config,
     )
+    debug_log("veo_operation_created", video_id=video.video_id, operation=repr(operation))
     attempts = 0
     while not operation.done and attempts < 30:
         time.sleep(10)
         operation = client.operations.get(operation)
         attempts += 1
+        debug_log("veo_poll", video_id=video.video_id, attempt=attempts, done=getattr(operation, "done", None))
     if not operation.done:
+        debug_log("veo_timeout", video_id=video.video_id, attempts=attempts)
         raise RuntimeError("VEO_TIMEOUT")
+    response_repr = repr(getattr(operation, "response", None))[:1000]
+    debug_log("veo_operation_done", video_id=video.video_id, response=response_repr)
     generated_videos = getattr(operation.response, "generated_videos", None) or []
     if not generated_videos:
+        debug_log("veo_empty_response", video_id=video.video_id, response=response_repr)
         raise RuntimeError("VEO_EMPTY_RESPONSE")
     generated = generated_videos[0]
     temp_video = VIDEO_OUTPUT_DIR / f"{video.video_id}.veo.mp4"
+    debug_log("veo_download_start", video_id=video.video_id, destination=str(temp_video))
     client.files.download(file=generated.video, destination=str(temp_video))
+    debug_log("veo_download_done", video_id=video.video_id, exists=temp_video.exists(), size=temp_video.stat().st_size if temp_video.exists() else 0)
     mux_video_with_audio(temp_video, video, output_file)
     video.engine_label = f"{VEO_VIDEO_MODEL} + Gemini TTS" if video.narration_audio_path else VEO_VIDEO_MODEL
 
@@ -915,6 +941,13 @@ def ensure_generated_video(video: VideoRecord) -> None:
                     status=video.status,
                 )
             except Exception as exc:
+                debug_log(
+                    "premium_video_fallback",
+                    video_id=video.video_id,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc)[:500],
+                    traceback=traceback.format_exc()[:4000],
+                )
                 add_log(
                     event="premium_video_fallback",
                     user_id=video.user_id,
