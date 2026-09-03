@@ -344,8 +344,9 @@ NARRATION_VOICE_OPTIONS = {
     },
 }
 EDGE_TTS_FALLBACK_VOICE = "ja-JP-NanamiNeural"
-VEO_VIDEO_MODEL = os.getenv("VEO_VIDEO_MODEL", "veo-3.1-fast-generate-preview")
+VEO_VIDEO_MODEL = os.getenv("VEO_VIDEO_MODEL", "veo-3.1-generate-preview")
 VEO_VIDEO_RESOLUTION = os.getenv("VEO_VIDEO_RESOLUTION", "720p")
+VEO_VIDEO_DURATION_SECONDS = os.getenv("VEO_VIDEO_DURATION_SECONDS", "6")
 
 
 def now_utc() -> datetime:
@@ -704,15 +705,24 @@ def render_ai_premium_video(video: VideoRecord, image_path: Path, output_file: P
     aspect_ratio = PLATFORM_PRESETS.get(video.platform, PlatformPreset(name=video.platform, aspect_ratio="9:16", output_size="1080x1920")).aspect_ratio.split(" /")[0]
     if aspect_ratio not in {"9:16", "16:9"}:
         aspect_ratio = "9:16"
+    resolution = (VEO_VIDEO_RESOLUTION or "720p").strip().lower() or "720p"
+    try:
+        requested_duration = int((VEO_VIDEO_DURATION_SECONDS or "6").strip())
+    except ValueError:
+        requested_duration = 6
+    if resolution in {"1080p", "4k"}:
+        duration_seconds = 8
+    else:
+        duration_seconds = requested_duration if requested_duration in {4, 6, 8} else 6
     operation = client.models.generate_videos(
         model=VEO_VIDEO_MODEL,
         prompt=build_visual_prompt(video),
         image=image,
         config={
             "aspect_ratio": aspect_ratio,
-            "duration_seconds": 8,
-            "resolution": VEO_VIDEO_RESOLUTION,
-            "generate_audio": False,
+            "duration_seconds": duration_seconds,
+            "resolution": resolution,
+            "person_generation": "allow_adult",
         },
     )
     attempts = 0
@@ -722,7 +732,10 @@ def render_ai_premium_video(video: VideoRecord, image_path: Path, output_file: P
         attempts += 1
     if not operation.done:
         raise RuntimeError("VEO_TIMEOUT")
-    generated = operation.response.generated_videos[0]
+    generated_videos = getattr(operation.response, "generated_videos", None) or []
+    if not generated_videos:
+        raise RuntimeError("VEO_EMPTY_RESPONSE")
+    generated = generated_videos[0]
     temp_video = VIDEO_OUTPUT_DIR / f"{video.video_id}.veo.mp4"
     client.files.download(file=generated.video, destination=str(temp_video))
     mux_video_with_audio(temp_video, video, output_file)
@@ -901,14 +914,14 @@ def ensure_generated_video(video: VideoRecord) -> None:
                     video_id=video.video_id,
                     status=video.status,
                 )
-            except Exception:
+            except Exception as exc:
                 add_log(
                     event="premium_video_fallback",
                     user_id=video.user_id,
                     project_id=video.project_id,
                     video_id=video.video_id,
                     status=video.status,
-                    error_code="PREMIUM_FALLBACK_STANDARD",
+                    error_code=f"PREMIUM_FALLBACK_STANDARD:{type(exc).__name__}:{str(exc)[:120]}",
                 )
                 render_standard_image_video(video, image_path, output_file)
                 video.engine_label = f"FFmpeg ズーム/パン（{VEO_VIDEO_MODEL}失敗時フォールバック）"
