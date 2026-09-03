@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -186,6 +187,7 @@ class CreateVideoRequest(BaseModel):
     assets: List[AssetInput]
     narration_enabled: bool = False
     narration_text: Optional[str] = None
+    narration_voice: Optional[str] = None
 
 
 class VideoCreateResponse(BaseModel):
@@ -209,6 +211,7 @@ class VideoRecord(BaseModel):
     assets: List[AssetInput]
     narration_enabled: bool = False
     narration_text: Optional[str] = None
+    narration_voice: Optional[str] = None
     narration_audio_path: Optional[str] = None
     status: JobStatus
     created_at: datetime
@@ -238,6 +241,7 @@ class ResultResponse(BaseModel):
     generated_video_url: Optional[str] = None
     narration_enabled: bool = False
     narration_text: Optional[str] = None
+    narration_voice: Optional[str] = None
     narration_audio_url: Optional[str] = None
     output_policy: OutputPolicy
     transform_plan: TransformPlan
@@ -301,7 +305,26 @@ ALLOWED_QUALITIES = {
 LENGTH_PRIORITY = ["短め", "ふつう", "長め", "しっかり長め"]
 QUALITY_PRIORITY = ["標準", "高め", "高画質 / HD"]
 BASE_DURATION_SECONDS = {"短め": 4, "ふつう": 6, "長め": 8, "しっかり長め": 10}
-DEFAULT_NARRATION_VOICE = "ja-JP-NanamiNeural"
+DEFAULT_NARRATION_PRESET = "smooth"
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
+NARRATION_VOICE_OPTIONS = {
+    "soft": {
+        "label": "やわらかい",
+        "voice": "Achernar",
+        "style": "やさしく、柔らかく、押しつけがましくない自然な日本語ナレーション",
+    },
+    "smooth": {
+        "label": "なめらか",
+        "voice": "Algieba",
+        "style": "滑らかで聞き疲れしにくく、AIっぽさを抑えた自然な日本語ナレーション",
+    },
+    "friendly": {
+        "label": "親しみやすい",
+        "voice": "Achird",
+        "style": "親しみやすく、会話に近い、あたたかい日本語ナレーション",
+    },
+}
+EDGE_TTS_FALLBACK_VOICE = "ja-JP-NanamiNeural"
 
 
 def now_utc() -> datetime:
@@ -395,6 +418,31 @@ def normalize_narration_text(raw_text: Optional[str]) -> Optional[str]:
     return text[:300]
 
 
+def normalize_narration_voice(raw_voice: Optional[str]) -> str:
+    candidate = (raw_voice or "").strip()
+    if candidate in NARRATION_VOICE_OPTIONS:
+        return candidate
+    return DEFAULT_NARRATION_PRESET
+
+
+def narration_voice_label(voice: Optional[str]) -> str:
+    preset = NARRATION_VOICE_OPTIONS.get(normalize_narration_voice(voice), NARRATION_VOICE_OPTIONS[DEFAULT_NARRATION_PRESET])
+    return str(preset["label"])
+
+
+def build_gemini_tts_prompt(video: VideoRecord) -> str:
+    preset = NARRATION_VOICE_OPTIONS.get(normalize_narration_voice(video.narration_voice), NARRATION_VOICE_OPTIONS[DEFAULT_NARRATION_PRESET])
+    style_text = preset["style"]
+    narration_text = video.narration_text or ""
+    return (
+        "次の文章を日本語で読み上げてください。"
+        "不自然なAI調を避け、語尾を言い切りすぎず、"
+        "間の取り方を自然にし、誇張しすぎない案内口調にしてください。"
+        f"話し方の方向性: {style_text}。"
+        f"本文: {narration_text}"
+    )
+
+
 def estimate_narration_duration_seconds(text: Optional[str]) -> int:
     if not text:
         return 0
@@ -410,10 +458,50 @@ def build_video_duration_seconds(video: VideoRecord) -> int:
 def synthesize_narration_audio(video: VideoRecord) -> None:
     if not video.narration_enabled or not video.narration_text:
         return
-    output_file = AUDIO_OUTPUT_DIR / f"{video.video_id}.mp3"
+    output_file = AUDIO_OUTPUT_DIR / f"{video.video_id}.wav"
     if output_file.exists():
         video.narration_audio_path = f"/static/audio/{output_file.name}"
         return
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    preset_key = normalize_narration_voice(video.narration_voice)
+    preset = NARRATION_VOICE_OPTIONS.get(preset_key, NARRATION_VOICE_OPTIONS[DEFAULT_NARRATION_PRESET])
+
+    if api_key:
+        try:
+            from google import genai
+            client = genai.Client(api_key=api_key)
+            interaction = client.interactions.create(
+                model=GEMINI_TTS_MODEL,
+                input=build_gemini_tts_prompt(video),
+                response_format={"type": "audio"},
+                generation_config={
+                    "speech_config": [
+                        {"voice": str(preset["voice"])}
+                    ]
+                },
+            )
+            audio_data = base64.b64decode(interaction.output_audio.data)
+            output_file.write_bytes(audio_data)
+            video.narration_audio_path = f"/static/audio/{output_file.name}"
+            add_log(
+                event="narration_generated_gemini",
+                user_id=video.user_id,
+                project_id=video.project_id,
+                video_id=video.video_id,
+                status=video.status,
+            )
+            return
+        except Exception:
+            add_log(
+                event="narration_gemini_failed_fallback",
+                user_id=video.user_id,
+                project_id=video.project_id,
+                video_id=video.video_id,
+                status=video.status,
+                error_code="GEMINI_TTS_FAILED",
+            )
+
     try:
         import edge_tts
     except Exception:
@@ -424,23 +512,25 @@ def synthesize_narration_audio(video: VideoRecord) -> None:
             project_id=video.project_id,
             video_id=video.video_id,
             status=video.status,
-            error_code="EDGE_TTS_NOT_AVAILABLE",
+            error_code="TTS_ENGINE_NOT_AVAILABLE",
         )
         return
 
     async def _save() -> None:
-        communicate = edge_tts.Communicate(video.narration_text, voice=DEFAULT_NARRATION_VOICE)
+        fallback_text = video.narration_text or ""
+        communicate = edge_tts.Communicate(fallback_text, voice=EDGE_TTS_FALLBACK_VOICE)
         await communicate.save(str(output_file))
 
     try:
         asyncio.run(_save())
         video.narration_audio_path = f"/static/audio/{output_file.name}"
         add_log(
-            event="narration_generated",
+            event="narration_generated_edge_fallback",
             user_id=video.user_id,
             project_id=video.project_id,
             video_id=video.video_id,
             status=video.status,
+            error_code=None if api_key else "GEMINI_API_KEY_MISSING",
         )
     except Exception:
         video.narration_audio_path = None
@@ -609,7 +699,7 @@ def ensure_generated_video(video: VideoRecord) -> None:
         f"testsrc2=size={actual_width}x{actual_height}:rate=12",
     ]
     if video.narration_audio_path:
-        ffmpeg_cmd += ["-i", str(AUDIO_OUTPUT_DIR / f"{video.video_id}.mp3")]
+        ffmpeg_cmd += ["-i", str(BASE_DIR / video.narration_audio_path.lstrip("/"))]
     else:
         ffmpeg_cmd += [
             "-f",
@@ -728,6 +818,7 @@ def to_result(video: VideoRecord, request: Request) -> ResultResponse:
         generated_video_url=generated_video_url,
         narration_enabled=video.narration_enabled,
         narration_text=video.narration_text,
+        narration_voice=narration_voice_label(video.narration_voice) if video.narration_enabled else None,
         narration_audio_url=build_absolute_url(request, video.narration_audio_path) if video.narration_audio_path else None,
         output_policy=get_output_policy(video.platform),
         transform_plan=build_transform_plan(video),
@@ -775,6 +866,7 @@ def create_video(payload: CreateVideoRequest) -> VideoCreateResponse:
         assets=payload.assets,
         narration_enabled=payload.narration_enabled,
         narration_text=normalize_narration_text(payload.narration_text) if payload.narration_enabled else None,
+        narration_voice=normalize_narration_voice(payload.narration_voice) if payload.narration_enabled else None,
         status=JobStatus.PREPARING,
         created_at=created,
         updated_at=created,
@@ -788,6 +880,7 @@ def create_video(payload: CreateVideoRequest) -> VideoCreateResponse:
         "quality": payload.quality,
         "narration_enabled": "true" if payload.narration_enabled else "false",
         "narration_text": normalize_narration_text(payload.narration_text) or "",
+        "narration_voice": narration_voice_label(payload.narration_voice) if payload.narration_enabled else "",
     }
 
     USER_PREFERENCES[payload.user_id] = {
