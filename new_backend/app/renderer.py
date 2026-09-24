@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import json
+import random
 import shutil
 import subprocess
 import uuid
@@ -72,8 +73,26 @@ def _probe_size(path: Path) -> tuple[int, int]:
         return im.size
 
 
-def _build_single_clip_filter(src_w: int, src_h: int, crop: UserCrop | None) -> str:
-    """1枚の写真から Ken Burns 風ズーム/パン付きのクリップを作るffmpegフィルタ文字列を組み立てる。"""
+# 【2026-09-24 追加】これまではどのクリップも「中央に向かってゆっくりズームインする」
+# 動きしか無く、ユーザーから「動きがズームだけしかない」と指摘された。パン(左右移動)や
+# ズームアウトも選べるようにし、1本の動画の中でクリップごとに動きが変わるようにする。
+_CAMERA_MOVES = ("zoom_in", "zoom_out", "pan_left_to_right", "pan_right_to_left")
+
+
+def _pick_camera_moves(n: int) -> list[str]:
+    """クリップ数ぶんのカメラワークを決める。動きのリストをシャッフルしてから順番に
+    (足りなければ繰り返して)割り当てることで、1本の動画内でできるだけ同じ動きが
+    連続しないようにする(写真1枚だけの動画でも、実行のたびに4種類からランダムに
+    選ばれるので「毎回ズームだけ」にはならない)。"""
+    shuffled = list(_CAMERA_MOVES)
+    random.shuffle(shuffled)
+    return [shuffled[i % len(shuffled)] for i in range(n)]
+
+
+def _build_single_clip_filter(src_w: int, src_h: int, crop: UserCrop | None, move_type: str) -> str:
+    """1枚の写真からKen Burns風のズーム/パン付きのクリップを作るffmpegフィルタ文字列を組み立てる。
+    move_typeで"zoom_in"/"zoom_out"/"pan_left_to_right"/"pan_right_to_left"の
+    いずれかの動きを選べる(_CAMERA_MOVES参照)。"""
 
     if crop is not None:
         # 人間が明示的に選んだクロップ範囲のみ適用(構想合意済みの「加工の範囲内」)。
@@ -108,6 +127,30 @@ def _build_single_clip_filter(src_w: int, src_h: int, crop: UserCrop | None) -> 
     # 計算量を約1/16に削減した(見た目は縮小・拡大されるため、ぼかし背景としては
     # 実用上ほぼ同じに見える)。
     bg_w, bg_h = TARGET_W // 4, TARGET_H // 4
+    d = int(CLIP_SECONDS * FPS)
+
+    # 【2026-09-24追加】move_typeごとにz(ズーム)/x/y(切り出し位置)の式を切り替える。
+    # ズーム系は以前と同じくonly-increasing/decreasingの滑らかな変化、パン系は
+    # zoomを1.15固定にして横方向にずらせる余地を確保し、x を時間(on/出力フレーム番号)
+    # に応じて左端↔右端まで動かす。yは常に中央固定(縦方向にはズレさせない=
+    # 写真の上下が不自然に見切れるのを防ぐ)。
+    if move_type == "zoom_out":
+        z_expr = "max(1.08-0.0007*on,1.0)"
+        x_expr = "iw/2-(iw/zoom/2)"
+        y_expr = "ih/2-(ih/zoom/2)"
+    elif move_type == "pan_left_to_right":
+        z_expr = "1.15"
+        x_expr = f"(iw-iw/zoom)*on/{max(d - 1, 1)}"
+        y_expr = "ih/2-(ih/zoom/2)"
+    elif move_type == "pan_right_to_left":
+        z_expr = "1.15"
+        x_expr = f"(iw-iw/zoom)*(1-on/{max(d - 1, 1)})"
+        y_expr = "ih/2-(ih/zoom/2)"
+    else:  # "zoom_in"(既定)
+        z_expr = "min(1.0+0.0007*on,1.08)"
+        x_expr = "iw/2-(iw/zoom/2)"
+        y_expr = "ih/2-(ih/zoom/2)"
+
     filter_complex = (
         f"[0:v]{pre}scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=increase,"
         f"crop={TARGET_W}:{TARGET_H},scale={bg_w}:{bg_h},gblur=sigma=8,"
@@ -115,9 +158,9 @@ def _build_single_clip_filter(src_w: int, src_h: int, crop: UserCrop | None) -> 
         f"[0:v]{pre}scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease[fg];"
         f"[bg][fg]overlay=(W-w)/2:(H-h)/2[canvas];"
         f"[canvas]zoompan="
-        f"z='min(zoom+0.0007,1.08)':"
-        f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-        f"d={int(CLIP_SECONDS * FPS)}:s={TARGET_W}x{TARGET_H}:fps={FPS}"
+        f"z='{z_expr}':"
+        f"x='{x_expr}':y='{y_expr}':"
+        f"d={d}:s={TARGET_W}x{TARGET_H}:fps={FPS}"
     )
     return filter_complex
 
@@ -143,10 +186,12 @@ def render_photo_safe_video(
     work_dir.mkdir(parents=True, exist_ok=True)
     clip_paths: list[Path] = []
 
+    camera_moves = _pick_camera_moves(len(assets))
+
     try:
         for i, asset in enumerate(assets):
             src_w, src_h = _probe_size(asset.path)
-            filter_complex = _build_single_clip_filter(src_w, src_h, asset.user_crop)
+            filter_complex = _build_single_clip_filter(src_w, src_h, asset.user_crop, camera_moves[i])
             clip_path = work_dir / f"clip_{i:03d}.mp4"
             cmd = [
                 "ffmpeg", "-y", "-loop", "1", "-i", str(asset.path),
