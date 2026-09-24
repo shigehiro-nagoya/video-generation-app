@@ -102,6 +102,20 @@ class CreateVideoRequestV2(BaseModel):
         return v
 
 
+class GoogleAuthRequest(BaseModel):
+    """【2026-09-24追加】Googleサインインで得たIDトークンをサーバーに送るためのリクエスト。"""
+    id_token: str
+
+
+class GoogleAuthResponse(BaseModel):
+    """【2026-09-24追加】サーバー側で検証・発行した「本当の」ユーザーIDとプランを返す。
+    クライアントはこの user_id を以後の動画生成リクエストで使う(匿名IDから移行)。
+    """
+    user_id: str
+    email: Optional[str] = None
+    plan: str
+
+
 class JobStatus(str, Enum):
     PREPARING = "PREPARING"
     PROCESSING = "PROCESSING"
