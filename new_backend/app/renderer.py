@@ -99,9 +99,19 @@ def _build_single_clip_filter(src_w: int, src_h: int, crop: UserCrop | None) -> 
     # これは本プロジェクトが除去対象としている「写真保全違反」そのものであるため、
     # 別途の pre-scale は行わず、zoompan 自身の z 引数でキャンバス全体に対して
     # ズームしつつ、x/y を常に中央基準の式にして切り出し位置を明示的に固定した。
+    # 【2026-09-24 修正・パフォーマンス】Renderの無料プラン(CPU 0.15コア相当)で
+    # 実際にデプロイして検証したところ、ぼかし背景の生成(1080x1920のフルサイズに
+    # 対してgblur sigma=30を直接かける処理)がCPUを長時間占有し、その間サーバーの
+    # 応答が止まってプロセスが再起動してしまう(=ジョブが永久にPROCESSINGのまま
+    # 消える)という実障害を実際に確認した。そこで、ぼかし背景は「大幅に縮小して
+    # からぼかし、最後に拡大し直す」という標準的な高速化手法に変更し、ぼかしの
+    # 計算量を約1/16に削減した(見た目は縮小・拡大されるため、ぼかし背景としては
+    # 実用上ほぼ同じに見える)。
+    bg_w, bg_h = TARGET_W // 4, TARGET_H // 4
     filter_complex = (
         f"[0:v]{pre}scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=increase,"
-        f"crop={TARGET_W}:{TARGET_H},gblur=sigma=30,eq=brightness=-0.08[bg];"
+        f"crop={TARGET_W}:{TARGET_H},scale={bg_w}:{bg_h},gblur=sigma=8,"
+        f"scale={TARGET_W}:{TARGET_H},eq=brightness=-0.08[bg];"
         f"[0:v]{pre}scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease[fg];"
         f"[bg][fg]overlay=(W-w)/2:(H-h)/2[canvas];"
         f"[canvas]zoompan="
@@ -142,7 +152,12 @@ def render_photo_safe_video(
                 "ffmpeg", "-y", "-loop", "1", "-i", str(asset.path),
                 "-filter_complex", filter_complex,
                 "-t", str(CLIP_SECONDS),
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(FPS),
+                # 【2026-09-24 修正・パフォーマンス】Render無料プラン(CPU 0.15コア相当)
+                # では既定のpreset(medium)だとエンコードがCPUを長時間占有し、
+                # プロセスが再起動してしまう不具合を実際に確認した。
+                # preset=ultrafastに変更してエンコードのCPU負荷を大幅に下げた。
+                "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1",
+                "-pix_fmt", "yuv420p", "-r", str(FPS),
                 str(clip_path),
             ]
             result = subprocess.run(cmd, capture_output=True, text=True)
