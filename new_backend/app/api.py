@@ -15,6 +15,7 @@ import base64
 import binascii
 import logging
 import mimetypes
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -66,6 +67,13 @@ _AI_PREMIUM_PLAN_QUOTA = {"FREE": 0, "LITE": 5, "PREMIUM": 20}
 # レガシー(未サインイン・DB未設定時)フォールバック用のメモリ管理。
 _USAGE: dict[str, int] = {}
 
+# 【2026-09-26追加・一時的】Task #6のRunway/Kling連携を実クラウドで検証するための
+# 開発者専用バイパス。本番ユーザーには課金なしでai_premiumを使わせたくないため、
+# Renderの環境変数 DEBUG_BYPASS_AI_PREMIUM_QUOTA が "1" の間だけ、
+# ai_premiumのプラン枠チェック(quota==0)を素通りさせる。検証が終わったら
+# 必ずこの環境変数を未設定に戻すこと(設定したままだと誰でも無料でRunway/Kling
+# の実費が発生するリクエストを送れてしまうため)。
+
 
 class ApiError(Exception):
     def __init__(self, status_code: int, detail: str):
@@ -103,7 +111,8 @@ async def create_video(request: Request) -> JSONResponse:
             used = _USAGE.get(req.user_id, 0) if mode == "standard" else 0
 
         quota = quota_table.get(real_plan, quota_table["FREE"])
-        if used >= quota:
+        debug_bypass = mode == "ai_premium" and os.environ.get("DEBUG_BYPASS_AI_PREMIUM_QUOTA") == "1"
+        if used >= quota and not debug_bypass:
             if mode == "ai_premium" and quota == 0:
                 raise ApiError(
                     402,
