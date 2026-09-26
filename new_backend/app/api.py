@@ -111,6 +111,11 @@ async def create_video(request: Request) -> JSONResponse:
                 )
             raise ApiError(402, f"今月の生成枠({quota}本)を使い切りました。プランをアップグレードしてください。")
 
+        if mode == "ai_premium" and len(req.assets) > 5:
+            # 【2026-09-26追加】ai_premiumは写真1枚ごとにRunway/Klingの実費が発生するため、
+            # 1回のリクエストで課金が意図せず大きくなりすぎないよう上限を設ける。
+            raise ApiError(422, "AI動画モード(ai_premium)は1回につき最大5枚までです")
+
         if req.generation_type.value == "PHOTO_SLIDESHOW" and len(req.assets) < 2:
             raise ApiError(422, "PHOTO_SLIDESHOW には2枚以上のassetsが必要です")
         if req.generation_type.value in ("PHOTO_TO_VIDEO", "VIDEO_TO_VIDEO") and len(req.assets) != 1:

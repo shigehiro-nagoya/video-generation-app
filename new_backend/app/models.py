@@ -34,7 +34,15 @@ class GenerationType(str, Enum):
 
 class RenderMode(str, Enum):
     STANDARD = "standard"        # ffmpeg ズーム/パンのみ。今すぐ動く。
-    AI_PREMIUM = "ai_premium"    # 生成モデル統合用の予約値。未実装なら501を返す。
+    AI_PREMIUM = "ai_premium"    # Runway/Kling連携。実費が発生する。
+
+
+class AiProvider(str, Enum):
+    """render_mode=ai_premium の場合にのみ意味を持つ、生成モデルの選択。
+    【2026-09-26追加】Task #6: RunwayとKlingの両方を実装し、選べるようにする。
+    既定はKling(Runwayより安価)。"""
+    KLING = "kling"
+    RUNWAY = "runway"
 
 
 class AssetKind(str, Enum):
@@ -78,6 +86,7 @@ class CreateVideoRequestV2(BaseModel):
     orientation: str = "vertical"
     quality: str = "standard"
     render_mode: RenderMode = RenderMode.STANDARD
+    ai_provider: AiProvider = AiProvider.KLING
     strict_photo: bool = True
     assets: list[AssetInputV2]
     narration_enabled: bool = False

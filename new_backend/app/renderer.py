@@ -210,21 +210,38 @@ def render_photo_safe_video(
                 raise RuntimeError(f"ffmpeg failed for asset {i}: {result.stderr[-2000:]}")
             clip_paths.append(clip_path)
 
-        if len(clip_paths) == 1:
-            shutil.copy(clip_paths[0], out_path)
-        else:
-            concat_list = work_dir / "concat.txt"
-            concat_list.write_text("\n".join(f"file '{p.resolve()}'" for p in clip_paths))
-            cmd = [
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-                "-c", "copy", str(out_path),
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                raise RuntimeError(f"ffmpeg concat failed: {result.stderr[-2000:]}")
+        concat_mp4s(clip_paths, out_path)
 
         verify_output(out_path, expected_min_clips=len(assets))
         return out_path
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def concat_mp4s(clip_paths: list[Path], out_path: Path) -> None:
+    """複数のmp4クリップを素朴な(再エンコード無しの)concatで1本に結合する。
+    1本しかない場合は単純コピー。standardモード(render_photo_safe_video)と
+    ai_premiumモード(jobs.py)の両方から使う共通処理として切り出した。
+    """
+    if not clip_paths:
+        raise RuntimeError("concat_mp4s: clip_paths が空です")
+
+    if len(clip_paths) == 1:
+        shutil.copy(clip_paths[0], out_path)
+        return
+
+    work_dir = out_path.parent / f"_concat_{uuid.uuid4().hex[:8]}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        concat_list = work_dir / "concat.txt"
+        concat_list.write_text("\n".join(f"file '{p.resolve()}'" for p in clip_paths))
+        cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
+            "-c", "copy", str(out_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg concat failed: {result.stderr[-2000:]}")
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
